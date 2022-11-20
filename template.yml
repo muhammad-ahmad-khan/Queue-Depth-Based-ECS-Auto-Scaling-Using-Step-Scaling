@@ -1,0 +1,493 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates a fargate based auto-scaling environment that processes work from an SQS queue
+Parameters:
+  DockerImageUrl:
+    Type: String
+    Default: latest
+
+  DockerContainerName:
+    Type: String
+    Default: consumer-service
+
+  EnvironmentName:
+    Type: String
+    Default: dev
+
+  Memory:
+    Type: String
+    Default: 8GB
+
+  Cpu:
+    Type: Number
+    Default: 2048 # 2 vCPU
+
+  ContainerPort:
+    Type: Number
+    Default: 3000
+
+  HealthCheckPath:
+    Type: String
+    Default: http://localhost:3000/check
+
+  FaragateScalingEnvSSM:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/config/ecs/FARGATE_SCALING_ENV"
+
+  QueueDepthScaleOutAlarmThresholdSSM:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/config/ecs/consumer-service/QUEUE_DEPTH_SCALE_OUT_ALARM_THRESHOLD"
+
+  CpuUtilizationScaleInAlarmThresholdSSM:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/config/ecs/consumer-service/CPU_UTILIZATION_SCALE_IN_ALARM_THRESHOLD"
+
+  CpuUtilizationNoComputeOrScaleInAlarmEvaluationPeriodsSSM:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/config/ecs/consumer-service/CPU_UTILIZATION_NO_COMPUTE_OR_SCALE_IN_ALARM_EVALUATION_PERIODS"
+
+  ComputeAutoScalingTargetMaxCapacitySSM:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/config/ecs/consumer-service/AUTO_SCALING_TARGET_MAX_CAPACITY"
+
+Conditions:
+  CreateNonProdResources: !Equals [!Ref FaragateScalingEnvSSM, 'non-prod']
+  CreateProdResources: !Equals [!Ref FaragateScalingEnvSSM, 'prod']
+
+Resources:
+  SQSQueue:
+    Type: 'AWS::SQS::Queue'
+    # Properties:
+    #   ReceiveMessageWaitTimeSeconds: 20
+    #   VisibilityTimeout: 1200 # 20 minutes
+    #   MessageRetentionPeriod: 1209600 # 14 Days
+
+  QueueUrlParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: !Join
+        - ''
+        - - /
+          - !Ref EnvironmentName
+          - /services/
+          - !Ref DockerContainerName
+          - /SQS_QUEUE_URL
+      Type: String
+      Value: !Ref SQSQueue
+
+  ComputeTaskLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Join
+        - /
+        - - /x-org
+          - ecs
+          - !Sub '${AWS::StackName}'
+          - logs
+
+  ComputeTaskRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: Required_Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sqs:*'
+                  - 'secretsmanager:*'
+                  - 'ssm:*'
+                  - 'logs:*'
+                  - 'dynamodb:*'
+                  - 's3:*'
+                  - 'ecs:*'
+                Resource: '*'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+  ComputeTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    DependsOn: ComputeTaskLogGroup
+    Properties:
+      TaskRoleArn: !GetAtt ComputeTaskRole.Arn
+      ExecutionRoleArn: !GetAtt ComputeTaskRole.Arn
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      ContainerDefinitions:
+        - Name: !Sub '${AWS::StackName}'
+          Image: !Ref DockerImageUrl
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: us-east-1
+              awslogs-group: !Ref ComputeTaskLogGroup
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub 'curl -f ${HealthCheckPath} || exit 1'
+            Interval: 30
+            Retries: 3
+            StartPeriod: 300
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: EnvironmentName
+              Value: !Ref EnvironmentName
+            - Name: SQS_QUEUE_URL
+              Value: !Ref SQSQueue
+
+  ComputeCluster:
+    Type: 'AWS::ECS::Cluster'
+    # Properties:
+    #   ClusterName: !Join ['-', [!Ref DockerContainerName, cluster]]
+
+  NonProdComputeService:
+    Type: 'AWS::ECS::Service'
+    Condition: CreateNonProdResources # only create if it is NonProd env
+    Properties:
+      Cluster: !Ref ComputeCluster
+      TaskDefinition: !Ref ComputeTaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      # Desired count should be 0; Otherwise the Task Scheduler will restart number of desired containers once they are stopped
+      DesiredCount: 0
+      # This may need to be adjusted if the container takes a while to start up
+      # HealthCheckGracePeriodSeconds: 30
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # Change it to DISABLED if you're using private subnets that have access to a NAT gateway
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !ImportValue ComputeSubnetA
+            - !ImportValue ComputeSubnetB
+            - !ImportValue ComputeSubnetC
+          SecurityGroups:
+            - !ImportValue ComputeSecurityGroup
+
+  ProdComputeService:
+    Type: 'AWS::ECS::Service'
+    Condition: CreateProdResources # only create if it is Prod env
+    Properties:
+      Cluster: !Ref ComputeCluster
+      TaskDefinition: !Ref ComputeTaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      DesiredCount: 1
+      # This may need to be adjusted if the container takes a while to start up
+      # HealthCheckGracePeriodSeconds: 30
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # Change it to DISABLED if you're using private subnets that have access to a NAT gateway
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !ImportValue ComputeSubnetA
+            - !ImportValue ComputeSubnetB
+            - !ImportValue ComputeSubnetC
+          SecurityGroups:
+            - !ImportValue ComputeSecurityGroup
+
+  ComputeAutoScalingRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - application-autoscaling.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+      - PolicyName: !Sub ${DockerContainerName}-ECSAutoScalingRole
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - ecs:UpdateService
+            - ecs:DescribeServices
+            - application-autoscaling:*
+            - cloudwatch:DescribeAlarms
+            - cloudwatch:GetMetricStatistics
+            Resource: "*"
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+
+  NonProdComputeAutoScalingTarget:
+    Type: 'AWS::ApplicationAutoScaling::ScalableTarget'
+    Condition: CreateNonProdResources # only create if it is NonProd env
+    Properties:
+      MinCapacity: 0 # As desired task can be 0
+      MaxCapacity: !Ref ComputeAutoScalingTargetMaxCapacitySSM
+      ResourceId: !Join
+          - '/'
+          - - service
+            - !Ref ComputeCluster
+            - !GetAtt NonProdComputeService.Name
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt ComputeAutoScalingRole.Arn
+
+  ProdComputeAutoScalingTarget:
+    Type: 'AWS::ApplicationAutoScaling::ScalableTarget'
+    Condition: CreateProdResources # only create if it is Prod env
+    Properties:
+      MinCapacity: 1 # As desired task can be 1 but not 0
+      MaxCapacity: !Ref ComputeAutoScalingTargetMaxCapacitySSM 
+      ResourceId: !Join
+          - '/'
+          - - service
+            - !Ref ComputeCluster
+            - !GetAtt ProdComputeService.Name
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt ComputeAutoScalingRole.Arn
+
+  # https://docs.aws.amazon.com/autoscaling/application/userguide/application-auto-scaling-step-scaling-policies.html
+  NonProdNoComputeAutoScalingPolicy:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Condition: CreateNonProdResources # only create if it is NonProd env
+    Properties:
+      PolicyName: !Sub ${DockerContainerName}-NonProdNoComputeAutoScalingPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref NonProdComputeAutoScalingTarget
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ExactCapacity # Can use PercentChangeInCapacity but then need to come up with configuration including some estimated change in percent
+        Cooldown: 60
+        MetricAggregationType: Average # Valid values are Minimum, Maximum, and Average. If the aggregation type is null, the value is treated as Average. 
+        StepAdjustments: 
+        - MetricIntervalLowerBound: !Ref AWS::NoValue
+          MetricIntervalUpperBound: 0
+          ScalingAdjustment: 0
+
+  # https://docs.aws.amazon.com/autoscaling/application/userguide/application-auto-scaling-step-scaling-policies.html
+  NonProdInitialComputeAutoScalingPolicy:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Condition: CreateNonProdResources # only create if it is NonProd env
+    Properties:
+      PolicyName: !Sub ${DockerContainerName}-NonProdInitialComputeAutoScalingPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref NonProdComputeAutoScalingTarget
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity # ChangeInCapacity —> Increase or decrease the current capacity of the scalable target by the specified value
+        Cooldown: 60 # 1 min delay 
+        MetricAggregationType: Minimum # Valid values are Minimum, Maximum, and Average. If the aggregation type is null, the value is treated as Average.
+        StepAdjustments: 
+        - MetricIntervalLowerBound: 0
+          MetricIntervalUpperBound: !Ref AWS::NoValue
+          ScalingAdjustment: 1 # scaling up by 1 container when the alarm is greater than or equal to the Metric Threshold
+
+  # https://docs.aws.amazon.com/autoscaling/application/userguide/application-auto-scaling-step-scaling-policies.html
+  NonProdComputeAutoScalingScaleOutPolicy:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Condition: CreateNonProdResources # only create if it is NonProd env
+    Properties:
+      PolicyName: !Sub ${DockerContainerName}-NonProdComputeAutoScalingScaleOutPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref NonProdComputeAutoScalingTarget
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity # ChangeInCapacity —> Increase or decrease the current capacity of the scalable target by the specified value
+        Cooldown: 60 # 1 min delay
+        MetricAggregationType: Minimum # Valid values are Minimum, Maximum, and Average. If the aggregation type is null, the value is treated as Average. 
+        StepAdjustments: 
+        - MetricIntervalLowerBound: 0  # 0 means exactly equal to Metric Threshold which is 10 defined using SSM parameter
+          MetricIntervalUpperBound: 15 # [Metrice Threshold + 15]
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: 15 # [Metrice Threshold + 15]
+          MetricIntervalUpperBound: 25 # [Metrice Threshold + 25]
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: 25 # [Metrice Threshold + 25]
+          MetricIntervalUpperBound: 35 # [Metrice Threshold + 35]
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: 35 # [Metrice Threshold + 35]
+          MetricIntervalUpperBound: 45 # [Metrice Threshold + 45]
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: 45 # [Metrice Threshold + 45]
+          ScalingAdjustment: 1
+
+  # https://docs.aws.amazon.com/autoscaling/application/userguide/application-auto-scaling-step-scaling-policies.html
+  ProdComputeAutoScalingScaleInPolicy:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Condition: CreateProdResources # only create if it is Prod env
+    Properties:
+      PolicyName: !Sub ${DockerContainerName}-ProdComputeAutoScalingScaleInPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ProdComputeAutoScalingTarget
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ExactCapacity # Can use PercentChangeInCapacity but then need to come up with configuration including some estimated change in percent
+        Cooldown: 60
+        MetricAggregationType: Average # Valid values are Minimum, Maximum, and Average. If the aggregation type is null, the value is treated as Average.
+        StepAdjustments: 
+        - MetricIntervalLowerBound: !Ref AWS::NoValue
+          MetricIntervalUpperBound: 0
+          ScalingAdjustment: 1
+
+  # https://docs.aws.amazon.com/autoscaling/application/userguide/application-auto-scaling-step-scaling-policies.html
+  ProdComputeAutoScalingScaleOutPolicy:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Condition: CreateProdResources # only create if it is Prod env
+    Properties:
+      PolicyName: !Sub ${DockerContainerName}-ProdComputeAutoScalingScaleOutPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ProdComputeAutoScalingTarget
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity # ChangeInCapacity —> Increase or decrease the current capacity of the scalable target by the specified value
+        Cooldown: 60 # 1 min delay
+        MetricAggregationType: Minimum # Valid values are Minimum, Maximum, and Average. If the aggregation type is null, the value is treated as Average.
+        StepAdjustments: 
+        - MetricIntervalLowerBound: 0  # 0 means exactly equal to Metric Threshold which is 10 defined using SSM parameter
+          MetricIntervalUpperBound: 15 # [Metrice Threshold + 15]
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: 15 # [Metrice Threshold + 15]
+          MetricIntervalUpperBound: 25 # [Metrice Threshold + 25]
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: 25 # [Metrice Threshold + 25]
+          MetricIntervalUpperBound: 35 # [Metrice Threshold + 35]
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: 35 # [Metrice Threshold + 35]
+          MetricIntervalUpperBound: 45 # [Metrice Threshold + 45]
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: 45 # [Metrice Threshold + 45]
+          ScalingAdjustment: 1
+
+# ######### https://docs.aws.amazon.com/AmazonECS/latest/developerguide/cloudwatch-metrics.html #########
+#                                       (Total CPU units used by tasks in service) x 100
+# Service CPU utilization =  ----------------------------------------------------------------------------
+#                            (Total CPU units specified in task definition) x (number of tasks in service)
+
+  NonProdCPUNoComputeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateNonProdResources # only create alarm if it is NonProd env
+    Properties:
+      AlarmName: !Sub ${DockerContainerName}-NonProdCPUNoComputeAlarm
+      AlarmDescription: Alarm if container utilize low CPU based on specified threshold!
+      Namespace: AWS/ECS # AWS::CloudWatch::Alarm.Period >= 60 for metrics in the AWS/ namespace
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ServiceName
+          Value:
+            Fn::GetAtt:
+            - NonProdComputeService
+            - Name
+        - Name: ClusterName
+          Value:
+            Ref: ComputeCluster
+      Statistic: Average # Not using Sum since the metric is CPUUtilization
+      Period: 60  # 60 seconds ( Period must be 10, 30 or a multiple of 60 but 10 and 30 can not be used with namespaces with the following prefix: AWS/ )
+      EvaluationPeriods: !Ref CpuUtilizationNoComputeOrScaleInAlarmEvaluationPeriodsSSM # setting evaluation period 3 because when there is no task at all usually cpu starts with 0 (this way first evaluation period will already hit even before the task start doing anything) & 2 more as part of taking extra precautions! Change it to 2 if needed but not 1
+      Threshold: !Ref CpuUtilizationScaleInAlarmThresholdSSM
+      ComparisonOperator: LessThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: NonProdNoComputeAutoScalingPolicy
+
+  NonProdInitialQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateNonProdResources # only create alarm if it is NonProd env
+    Properties:
+      AlarmName: !Sub ${DockerContainerName}-NonProdInitialQueueDepthAlarm
+      AlarmDescription: Alarm if queue depth grows beyond specified threshold!
+      Namespace: AWS/SQS # AWS::CloudWatch::Alarm.Period >= 60 for metrics in the AWS/ namespace
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value : !GetAtt SQSQueue.QueueName
+      Statistic: Sum
+      Period: 60 # 60 seconds ( Period must be 10, 30 or a multiple of 60 but 10 and 30 can not be used with namespaces with the following prefix: AWS/ )
+      EvaluationPeriods: 1
+      Threshold: 1 # Threshold is 1 for initial depth
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: NonProdInitialComputeAutoScalingPolicy
+
+  NonProdQueueDepthScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateNonProdResources # only create alarm if it is NonProd env
+    Properties:
+      AlarmName: !Sub ${DockerContainerName}-NonProdQueueDepthScaleOutAlarm
+      AlarmDescription: Alarm if queue depth grows beyond specified threshold!
+      Namespace: AWS/SQS # AWS::CloudWatch::Alarm.Period >= 60 for metrics in the AWS/ namespace
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value : !GetAtt SQSQueue.QueueName
+      Statistic: Sum
+      Period: 120 # 120 seconds ( Period must be 10, 30 or a multiple of 60 but 10 and 30 can not be used with namespaces with the following prefix: AWS/ )
+      EvaluationPeriods: 1
+      Threshold: !Ref QueueDepthScaleOutAlarmThresholdSSM # change this as needed
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: NonProdComputeAutoScalingScaleOutPolicy
+
+  ProdCPUScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateProdResources # only create alarm if it is Prod env
+    Properties:
+      AlarmName: !Sub ${DockerContainerName}-ProdCPUScaleInAlarm
+      AlarmDescription: Alarm if container utilize low cpu based on specified threshold!
+      Namespace: AWS/ECS # AWS::CloudWatch::Alarm.Period >= 60 for metrics in the AWS/ namespace
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ServiceName
+          Value:
+            Fn::GetAtt:
+            - ProdComputeService
+            - Name
+        - Name: ClusterName
+          Value:
+            Ref: ComputeCluster
+      Statistic: Average # Not using Sum since the metric is CPUUtilization
+      Period: 60  # 60 seconds ( Period must be 10, 30 or a multiple of 60 but 10 and 30 can not be used with namespaces with the following prefix: AWS/ )
+      EvaluationPeriods: !Ref CpuUtilizationNoComputeOrScaleInAlarmEvaluationPeriodsSSM # setting this 3 as part of taking extra precautions! Change it to 1 if needed
+      Threshold: !Ref CpuUtilizationScaleInAlarmThresholdSSM 
+      ComparisonOperator: LessThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: ProdComputeAutoScalingScaleInPolicy
+
+  ProdQueueDepthScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateProdResources # only create alarm if it is Prod env
+    Properties:
+      AlarmName: !Sub ${DockerContainerName}-ProdQueueDepthScaleOutAlarm
+      AlarmDescription: Alarm if queue depth grows beyond specified threshold!
+      Namespace: AWS/SQS # AWS::CloudWatch::Alarm.Period >= 60 for metrics in the AWS/ namespace
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value : !GetAtt SQSQueue.QueueName
+      Statistic: Sum
+      Period: 120 # 120 seconds ( Period must be 10, 30 or a multiple of 60 but 10 and 30 can not be used with namespaces with the following prefix: AWS/ )
+      EvaluationPeriods: 1
+      Threshold: !Ref QueueDepthScaleOutAlarmThresholdSSM # change this as needed
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: ProdComputeAutoScalingScaleOutPolicy
