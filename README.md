@@ -19,4 +19,4 @@ aws cloudformation deploy --template-file template.yml \
 ```
 
 * See the write up here:
-  https://dev.to/muhammad_ahmad_khan/sqs-depth-based-ecs-task-auto-scaling-using-step-scaling-5h4k
+  https://dev.to/muhammad_ahmad_khan/sqs-depth-based-ecs-task-auto-scaling-using-step-scaling-3l8m
